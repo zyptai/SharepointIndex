@@ -345,6 +345,7 @@ async function processSharePointFile(context, fileUrl) {
                 lastModified: file.lastModifiedDateTime,
                 chunkIndex: i + 1,
                 totalChuncks: chunks.length,
+                fileUrl: fileUrl  // Include the fileUrl in the document
             };
 
             indexDocuments.push(document);
