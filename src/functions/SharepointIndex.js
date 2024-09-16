@@ -204,7 +204,7 @@ async function uploadToBlobStorage(context, fileContent, fileName, contentType) 
     logMessage(context, `File uploaded successfully to Blob Storage with content type: ${contentType}`);
 }
 
-function chunkContent(context, content, maxChunkSize = 1000) {
+function chunkContent(context, content, maxChunkSize = 8000) {
     const chunks = [];
     let currentChunk = "";
 
@@ -233,12 +233,12 @@ async function deleteExistingDocuments(context, searchClient, fileUrl) {
     logMessage(context, `Deleting existing documents for fileUrl: ${fileUrl}`);
     const results = await searchClient.search('', { 
         filter: `fileUrl eq '${fileUrl}'`,
-        select: ['id']
+        select: ['docId']
     });
     
     const documentsToDelete = [];
     for await (const result of results.results) {
-        documentsToDelete.push({ id: result.document.id });
+        documentsToDelete.push({ docId: result.document.docId });
     }
 
     if (documentsToDelete.length > 0) {
@@ -307,32 +307,32 @@ async function processSharePointFile(context, fileUrl) {
         const indexDocuments = [];
 
         for (let i = 0; i < chunks.length; i++) {
-            const chunkName = `${file.name}_chunk_${i + 1}`;
             const chunkContent = chunks[i];
-
+        
             const embedding = await generateEmbedding(context, chunkContent);
             if (!embedding) {
                 throw new Error(`Failed to generate embedding for chunk ${i + 1}`);
             }
             logMessage(context, `Generated embedding for chunk ${i + 1}/${chunks.length}`);
-
+        
             const document = {
-                id: `${file.id}-${i + 1}`,
-                content: chunkContent,
-                contentVector: embedding,
+                docId: `${file.id}-${i + 1}`,
+                docTitle: file.name,
+                description: chunkContent,
                 filename: file.name,
-                fileType: path.extname(file.name),
-                lastModified: file.lastModifiedDateTime,
-                chunkIndex: i + 1,
-                totalChunks: chunks.length,
+                filetype: path.extname(file.name),
+                lastmodified: file.lastModifiedDateTime,
+                chunkindex: (i + 1).toString(),  // Changed to string
+                totalChuncks: chunks.length.toString(),  // Changed to string
+                descriptionVector: embedding,
                 fileUrl: fileUrl
             };
-
+        
             indexDocuments.push(document);
-
-            logMessage(context, `Prepared metadata for chunk ${i + 1}`, { ...document, embedding: 'Embedding data (not shown due to size)' });
+        
+            logMessage(context, `Prepared metadata for chunk ${i + 1}`, { ...document, descriptionVector: 'Embedding data (not shown due to size)' });
         }
-
+        
         await searchClient.uploadDocuments(indexDocuments);
 
         logMessage(context, "File processing and indexing completed", {
@@ -385,6 +385,9 @@ async function extractTextContent(context, file, fileContent) {
         case '.pdf':
             const pdfData = await pdfParse(fileContent);
             textContent = pdfData.text;
+            break;            
+        case '.pptx':
+            textContent = await extractTextFromPowerPoint(fileContent);
             break;
         default:
             throw new Error(`Unsupported file format: ${fileExtension}`);
@@ -393,6 +396,32 @@ async function extractTextContent(context, file, fileContent) {
     logMessage(context, `Extracted text content from ${fileExtension} file`);
     logMessage(context, "Extracted Text Content (First 500 characters):", textContent.slice(0, 500));
     return textContent;
+}
+
+async function extractTextFromPowerPoint(buffer) {
+    return new Promise((resolve, reject) => {
+        const pptx = officegen('pptx');
+        pptx.on('error', (err) => {
+            reject(err);
+        });
+
+        pptx.load(buffer, (err) => {
+            if (err) {
+                reject(err);
+                return;
+            }
+
+            let text = '';
+            pptx.getSlides().forEach((slide, index) => {
+                text += `Slide ${index + 1}:\n`;
+                if (slide.data && slide.data.text) {
+                    text += slide.data.text + '\n\n';
+                }
+            });
+
+            resolve(text.trim());
+        });
+    });
 }
 
 async function main() {
