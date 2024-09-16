@@ -7,13 +7,14 @@ const { app } = require('@azure/functions');
 const { TextDecoder } = require('util');
 const { SearchClient, AzureKeyCredential } = require("@azure/search-documents");
 const { OpenAIEmbeddings } = require("@microsoft/teams-ai");
+const mammoth = require('mammoth');
+const xlsx = require('xlsx');
+const csv = require('csv-parser');
+const pdfParse = require('pdf-parse');
+const { Readable } = require('stream');
+const path = require('path');
 require('isomorphic-fetch');
 require('dotenv').config();
-
-// Application Insights Setup
-//const appInsights = require('applicationinsights');
-//appInsights.setup().start();
-//const appInsightsClient = appInsights.defaultClient;
 
 app.http('SharepointIndex', {
     methods: ['GET', 'POST'],
@@ -68,8 +69,6 @@ app.http('SharepointIndex', {
     }
 });
 
-
-
 function logMessage(context, message, obj = null) {
     if (obj) {
         context.log(message, obj);
@@ -106,7 +105,6 @@ async function generateEmbedding(context, text) {
         throw error;
     }
 }
-
 
 function checkRequiredEnvVars(context) {
     const requiredVars = [
@@ -202,35 +200,17 @@ async function uploadToBlobStorage(context, fileContent, fileName, contentType) 
 }
 
 function chunkContent(context, content, maxChunkSize = 1000) {
-    const decoder = new TextDecoder('utf-8');
-    const text = decoder.decode(content);
     const chunks = [];
     let currentChunk = "";
 
-    const sentences = text.match(/[^.!?]+[.!?]+|\s+/g) || [];
+    const sentences = content.match(/[^.!?]+[.!?]+|\s+/g) || [];
 
     for (const sentence of sentences) {
-        const currentByteLength = Buffer.byteLength(currentChunk, 'utf8');
-        const sentenceByteLength = Buffer.byteLength(sentence, 'utf8');
-
-        if (currentByteLength + sentenceByteLength > maxChunkSize && currentByteLength > 0) {
+        if ((currentChunk + sentence).length > maxChunkSize && currentChunk.length > 0) {
             chunks.push(currentChunk.trim());
             currentChunk = "";
         }
-
-        if (sentenceByteLength > maxChunkSize) {
-            const words = sentence.split(/\s+/);
-            for (const word of words) {
-                const wordByteLength = Buffer.byteLength(word, 'utf8');
-                if (currentByteLength + wordByteLength > maxChunkSize && currentByteLength > 0) {
-                    chunks.push(currentChunk.trim());
-                    currentChunk = "";
-                }
-                currentChunk += word + " ";
-            }
-        } else {
-            currentChunk += sentence;
-        }
+        currentChunk += sentence;
     }
 
     if (currentChunk.trim().length > 0) {
@@ -243,29 +223,6 @@ function chunkContent(context, content, maxChunkSize = 1000) {
 
     return chunks;
 }
-
-async function buildIndexData(context, documents) {
-    const searchEndpoint = process.env.AZURE_SEARCH_ENDPOINT;
-    const apiKey = process.env.SECRET_AZURE_SEARCH_KEY;
-    const indexName = process.env.AZURE_SEARCH_INDEX_NAME;
-
-    if (!searchEndpoint || !apiKey || !indexName) {
-        throw new Error("Environment variables AZURE_SEARCH_ENDPOINT, SECRET_AZURE_SEARCH_KEY, and AZURE_SEARCH_INDEX_NAME must be set.");
-    }
-
-    const client = new SearchClient(searchEndpoint, indexName, new AzureKeyCredential(apiKey));
-
-    try {
-        const result = await client.mergeOrUploadDocuments(documents);
-        logMessage(context, "Documents indexed successfully:", result);
-    } catch (error) {
-        logMessage(context, "Error indexing documents:", error);
-        //appInsightsClient.trackException({ exception: error });
-        throw error;
-    }
-}
-
-const mammoth = require('mammoth');
 
 async function processSharePointFile(context, fileUrl) {
     logMessage(context, "ProcessSharePointFile function started");
@@ -306,64 +263,30 @@ async function processSharePointFile(context, fileUrl) {
         const response = await axios.get(file['@microsoft.graph.downloadUrl'], { responseType: 'arraybuffer' });
         logMessage(context, `File content downloaded. Size: ${response.data.length} bytes`);
 
-        let textContent = '';
-        if (file.name.endsWith('.docx')) {
-            logMessage(context, 'Converting .docx file to text');
-            const result = await mammoth.extractRawText({ buffer: response.data });
-            textContent = result.value;
-            logMessage(context, "Extracted Text Content (First 500 characters):", textContent.slice(0, 500));
-        } else {
-            throw new Error("Unsupported file format. Only .docx files are supported in this implementation.");
-        }
+        let textContent = await extractTextContent(context, file, response.data);
 
-        const chunks = chunkContent(context, Buffer.from(textContent, 'utf-8'));
+        const chunks = chunkContent(context, textContent);
         const contentType = file.file ? file.file.mimeType : 'application/octet-stream';
 
         logMessage(context, `File chunked into ${chunks.length} parts`);
 
-        const indexDocuments = [];
+        const searchClient = initializeSearchClient();
 
-        for (let i = 0; i < chunks.length; i++) {
-            const chunkName = `${file.name}_chunk_${i + 1}`;
-            const chunkContent = Buffer.from(chunks[i], 'utf-8');
+        // Delete existing documents
+        await deleteExistingDocuments(context, searchClient, fileUrl);
 
-            //await uploadToBlobStorage(context, chunkContent, chunkName, contentType);
-            //logMessage(context, `Uploaded chunk ${i + 1}/${chunks.length}. Size: ${chunkContent.length} bytes`);
-
-            const embedding = await generateEmbedding(context, chunks[i]);
-            if (!embedding) {
-                throw new Error(`Failed to generate embedding for chunk ${i + 1}`);
-            }
-            logMessage(context, `Generated embedding for chunk ${i + 1}/${chunks.length}`);
-
-            const document = {
-                docid: `${file.id}-${i + 1}`,
-                description: chunks[i],
-                filename: file.name,
-                descriptionVector: embedding,
-                fileType: contentType,
-                lastModified: file.lastModifiedDateTime,
-                chunkIndex: i + 1,
-                totalChuncks: chunks.length,
-                fileUrl: fileUrl  // Include the fileUrl in the document
-            };
-
-            indexDocuments.push(document);
-
-            logMessage(context, `Prepared metadata for chunk ${i + 1}`, { ...document, embedding: 'Embedding data (not shown due to size)' });
-        }
-
-        await buildIndexData(context, indexDocuments);
+        // Index new chunks
+        await indexNewChunks(context, searchClient, chunks, file, fileUrl, contentType);
 
         logMessage(context, "File processing and indexing completed", {
             fileName: file.name,
             fileType: contentType,
             lastModified: file.lastModifiedDateTime,
-            totalChuncks: chunks.length,
+            totalChunks: chunks.length,
             totalSize: response.data.length
         });
 
-        return `Successfully processed and indexed file: ${file.name}. Chunked into ${chunks.length} parts, uploaded to Blob Storage, and indexed. Total Size: ${response.data.length} bytes. File Type: ${contentType}`;
+        return `Successfully processed and indexed file: ${file.name}. Chunked into ${chunks.length} parts and indexed. Total Size: ${response.data.length} bytes. File Type: ${contentType}`;
     } catch (error) {
         logMessage(context, "Error processing and indexing file", {
             error: error.message,
@@ -374,20 +297,74 @@ async function processSharePointFile(context, fileUrl) {
     }
 }
 
-async function main() {
-    try {
-        const result = await processSharePointFile(null, process.env.DEFAULT_SHAREPOINT_FILE_PATH);
-        console.log(result);
-    } catch (error) {
-        console.error("Error in main function:", error.message);
-        if (error.message.includes("environment variables")) {
-            console.error("Please ensure all required environment variables are set in your .env.local file");
-        }
+async function extractTextContent(context, file, fileContent) {
+    const fileExtension = path.extname(file.name).toLowerCase();
+    let textContent = '';
+
+    switch (fileExtension) {
+        case '.docx':
+            const result = await mammoth.extractRawText({ buffer: fileContent });
+            textContent = result.value;
+            break;
+        case '.xlsx':
+            const workbook = xlsx.read(fileContent, {type:'buffer'});
+            textContent = workbook.SheetNames.map(sheetName => {
+                const sheet = workbook.Sheets[sheetName];
+                return xlsx.utils.sheet_to_csv(sheet);
+            }).join('\n');
+            break;
+        case '.csv':
+            textContent = await new Promise((resolve) => {
+                let result = '';
+                Readable.from(fileContent)
+                    .pipe(csv())
+                    .on('data', (row) => { result += Object.values(row).join(' ') + '\n'; })
+                    .on('end', () => { resolve(result); });
+            });
+            break;
+        case '.txt':
+            textContent = fileContent.toString('utf8');
+            break;
+        case '.pdf':
+            const pdfData = await pdfParse(fileContent);
+            textContent = pdfData.text;
+            break;
+        default:
+            throw new Error(`Unsupported file format: ${fileExtension}`);
+    }
+
+    logMessage(context, `Extracted text content from ${fileExtension} file`);
+    logMessage(context, "Extracted Text Content (First 500 characters):", textContent.slice(0, 500));
+    return textContent;
+}
+
+function initializeSearchClient() {
+    return new SearchClient(
+        process.env.AZURE_SEARCH_ENDPOINT,
+        process.env.AZURE_SEARCH_INDEX_NAME,
+        new AzureKeyCredential(process.env.SECRET_AZURE_SEARCH_KEY)
+    );
+}
+
+async function deleteExistingDocuments(context, searchClient, fileUrl) {
+    logMessage(context, `Deleting existing documents for fileUrl: ${fileUrl}`);
+    const results = await searchClient.search('', { 
+        filter: `fileUrl eq '${fileUrl}'`,
+        select: ['id']
+    });
+    
+    const documentsToDelete = [];
+    for await (const result of results.results) {
+        documentsToDelete.push({ id: result.document.id });
+    }
+
+    if (documentsToDelete.length > 0) {
+        await searchClient.deleteDocuments(documentsToDelete);
+        logMessage(context, `Deleted ${documentsToDelete.length} existing documents`);
+    } else {
+        logMessage(context, "No existing documents found to delete");
     }
 }
 
-if (require.main === module) {
-    main();
-}
-
-module.exports = { processSharePointFile };
+async function indexNewChunks(context, searchClient, chunks, file, fileUrl, contentType) {
+    const index
