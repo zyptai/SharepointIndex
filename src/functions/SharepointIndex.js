@@ -16,6 +16,11 @@ const path = require('path');
 require('isomorphic-fetch');
 require('dotenv').config();
 
+// Application Insights Setup
+//const appInsights = require('applicationinsights');
+//appInsights.setup().start();
+//const appInsightsClient = appInsights.defaultClient;
+
 app.http('SharepointIndex', {
     methods: ['GET', 'POST'],
     authLevel: 'anonymous',
@@ -224,6 +229,26 @@ function chunkContent(context, content, maxChunkSize = 1000) {
     return chunks;
 }
 
+async function deleteExistingDocuments(context, searchClient, fileUrl) {
+    logMessage(context, `Deleting existing documents for fileUrl: ${fileUrl}`);
+    const results = await searchClient.search('', { 
+        filter: `fileUrl eq '${fileUrl}'`,
+        select: ['id']
+    });
+    
+    const documentsToDelete = [];
+    for await (const result of results.results) {
+        documentsToDelete.push({ id: result.document.id });
+    }
+
+    if (documentsToDelete.length > 0) {
+        await searchClient.deleteDocuments(documentsToDelete);
+        logMessage(context, `Deleted ${documentsToDelete.length} existing documents`);
+    } else {
+        logMessage(context, "No existing documents found to delete");
+    }
+}
+
 async function processSharePointFile(context, fileUrl) {
     logMessage(context, "ProcessSharePointFile function started");
 
@@ -270,13 +295,45 @@ async function processSharePointFile(context, fileUrl) {
 
         logMessage(context, `File chunked into ${chunks.length} parts`);
 
-        const searchClient = initializeSearchClient();
+        const searchClient = new SearchClient(
+            process.env.AZURE_SEARCH_ENDPOINT,
+            process.env.AZURE_SEARCH_INDEX_NAME,
+            new AzureKeyCredential(process.env.SECRET_AZURE_SEARCH_KEY)
+        );
 
         // Delete existing documents
         await deleteExistingDocuments(context, searchClient, fileUrl);
 
-        // Index new chunks
-        await indexNewChunks(context, searchClient, chunks, file, fileUrl, contentType);
+        const indexDocuments = [];
+
+        for (let i = 0; i < chunks.length; i++) {
+            const chunkName = `${file.name}_chunk_${i + 1}`;
+            const chunkContent = chunks[i];
+
+            const embedding = await generateEmbedding(context, chunkContent);
+            if (!embedding) {
+                throw new Error(`Failed to generate embedding for chunk ${i + 1}`);
+            }
+            logMessage(context, `Generated embedding for chunk ${i + 1}/${chunks.length}`);
+
+            const document = {
+                id: `${file.id}-${i + 1}`,
+                content: chunkContent,
+                contentVector: embedding,
+                filename: file.name,
+                fileType: path.extname(file.name),
+                lastModified: file.lastModifiedDateTime,
+                chunkIndex: i + 1,
+                totalChunks: chunks.length,
+                fileUrl: fileUrl
+            };
+
+            indexDocuments.push(document);
+
+            logMessage(context, `Prepared metadata for chunk ${i + 1}`, { ...document, embedding: 'Embedding data (not shown due to size)' });
+        }
+
+        await searchClient.uploadDocuments(indexDocuments);
 
         logMessage(context, "File processing and indexing completed", {
             fileName: file.name,
@@ -338,33 +395,20 @@ async function extractTextContent(context, file, fileContent) {
     return textContent;
 }
 
-function initializeSearchClient() {
-    return new SearchClient(
-        process.env.AZURE_SEARCH_ENDPOINT,
-        process.env.AZURE_SEARCH_INDEX_NAME,
-        new AzureKeyCredential(process.env.SECRET_AZURE_SEARCH_KEY)
-    );
-}
-
-async function deleteExistingDocuments(context, searchClient, fileUrl) {
-    logMessage(context, `Deleting existing documents for fileUrl: ${fileUrl}`);
-    const results = await searchClient.search('', { 
-        filter: `fileUrl eq '${fileUrl}'`,
-        select: ['id']
-    });
-    
-    const documentsToDelete = [];
-    for await (const result of results.results) {
-        documentsToDelete.push({ id: result.document.id });
-    }
-
-    if (documentsToDelete.length > 0) {
-        await searchClient.deleteDocuments(documentsToDelete);
-        logMessage(context, `Deleted ${documentsToDelete.length} existing documents`);
-    } else {
-        logMessage(context, "No existing documents found to delete");
+async function main() {
+    try {
+        const result = await processSharePointFile(null, process.env.DEFAULT_SHAREPOINT_FILE_PATH);
+        console.log(result);
+    } catch (error) {
+        console.error("Error in main function:", error.message);
+        if (error.message.includes("environment variables")) {
+            console.error("Please ensure all required environment variables are set in your .env.local file");
+        }
     }
 }
 
-async function indexNewChunks(context, searchClient, chunks, file, fileUrl, contentType) {
-    const index
+if (require.main === module) {
+    main();
+}
+
+module.exports = { processSharePointFile };
