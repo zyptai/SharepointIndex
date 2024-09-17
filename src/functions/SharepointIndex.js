@@ -15,11 +15,39 @@ const { Readable } = require('stream');
 const path = require('path');
 require('isomorphic-fetch');
 require('dotenv').config();
+const PptxExtractor = require('pptx-extractor');
 
 // Application Insights Setup
 //const appInsights = require('applicationinsights');
 //appInsights.setup().start();
 //const appInsightsClient = appInsights.defaultClient;
+
+app.storageQueue('SharepointIndex', {
+    queueName: 'file-processing-queue',
+    connection: 'AzureWebJobsStorage', // Make sure this connection string is set in your Function App settings
+    handler: async (queueItem, context) => {
+        try {
+            context.log('Queue trigger function processed work item', queueItem);
+
+            let fileUrl;
+            if (typeof queueItem === 'string') {
+                fileUrl = queueItem;
+            } else if (queueItem && queueItem.fileUrl) {
+                fileUrl = queueItem.fileUrl;
+            } else {
+                throw new Error('Invalid queue item: fileUrl not found');
+            }
+
+            logMessage(context, "Received fileUrl from queue:", { fileUrl });
+
+            const result = await processSharePointFile(context, fileUrl);
+            context.log(result);
+        } catch (error) {
+            context.log.error('Error processing queue item:', error.message);
+            throw error; // Rethrow to trigger Azure Functions retry policy
+        }
+    }
+});
 
 app.http('SharepointIndex', {
     methods: ['GET', 'POST'],
@@ -399,29 +427,48 @@ async function extractTextContent(context, file, fileContent) {
 }
 
 async function extractTextFromPowerPoint(buffer) {
-    return new Promise((resolve, reject) => {
-        const pptx = officegen('pptx');
-        pptx.on('error', (err) => {
-            reject(err);
-        });
+    try {
+        const zip = await unzipper.Open.buffer(buffer);
+        let text = '';
+        let slideCounter = 1;
 
-        pptx.load(buffer, (err) => {
-            if (err) {
-                reject(err);
-                return;
-            }
+        for (const file of zip.files) {
+            if (file.path.startsWith('ppt/slides/slide')) {
+                const content = await file.buffer();
+                const parser = new xml2js.Parser();
+                const result = await parser.parseStringPromise(content);
 
-            let text = '';
-            pptx.getSlides().forEach((slide, index) => {
-                text += `Slide ${index + 1}:\n`;
-                if (slide.data && slide.data.text) {
-                    text += slide.data.text + '\n\n';
+                if (result && result['p:sld'] && result['p:sld']['p:cSld']) {
+                    const slideContent = extractTextFromSlide(result['p:sld']['p:cSld'][0]);
+                    if (slideContent.trim()) {
+                        text += `Slide ${slideCounter}:\n${slideContent}\n\n`;
+                        slideCounter++;
+                    }
                 }
-            });
+            }
+        }
 
-            resolve(text.trim());
-        });
-    });
+        return text.trim();
+    } catch (error) {
+        console.error('Error extracting text from PowerPoint:', error);
+        throw error;
+    }
+}
+
+function extractTextFromSlide(slide) {
+    let text = '';
+    if (slide && slide['p:spTree'] && slide['p:spTree'][0] && slide['p:spTree'][0]['p:sp']) {
+        for (const shape of slide['p:spTree'][0]['p:sp']) {
+            if (shape['p:txBody'] && shape['p:txBody'][0] && shape['p:txBody'][0]['a:p']) {
+                for (const paragraph of shape['p:txBody'][0]['a:p']) {
+                    if (paragraph['a:r'] && paragraph['a:r'][0] && paragraph['a:r'][0]['a:t']) {
+                        text += paragraph['a:r'][0]['a:t'][0] + ' ';
+                    }
+                }
+            }
+        }
+    }
+    return text.trim();
 }
 
 async function main() {
@@ -440,4 +487,4 @@ if (require.main === module) {
     main();
 }
 
-module.exports = { processSharePointFile };
+module.exports = { extractTextFromPowerPoint };

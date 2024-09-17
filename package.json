@@ -19,8 +19,9 @@
     "dotenv": "^16.4.5",
     "isomorphic-fetch": "^3.0.0",
     "mammoth": "^1.8.0",
-    "officegen": "^0.6.5",
     "pdf-parse": "^1.1.1",
+    "unzipper": "^0.10.11",
+    "xml2js": "^0.6.2",
     "xlsx": "^0.18.5"
   },
   "main": "src/{index.js,functions/*.js}"
