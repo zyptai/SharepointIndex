@@ -11,20 +11,21 @@ const mammoth = require('mammoth');
 const xlsx = require('xlsx');
 const csv = require('csv-parser');
 const pdfParse = require('pdf-parse');
+const unzipper = require('unzipper');
+const xml2js = require('xml2js');
 const { Readable } = require('stream');
 const path = require('path');
 require('isomorphic-fetch');
 require('dotenv').config();
-const PptxExtractor = require('pptx-extractor');
 
 // Application Insights Setup
-//const appInsights = require('applicationinsights');
-//appInsights.setup().start();
-//const appInsightsClient = appInsights.defaultClient;
+const appInsights = require('applicationinsights');
+appInsights.setup().start();
+const appInsightsClient = appInsights.defaultClient;
 
-app.storageQueue('SharepointIndex', {
+app.storageQueue('ProcessQueueItem', {
     queueName: 'file-processing-queue',
-    connection: 'AzureWebJobsStorage', // Make sure this connection string is set in your Function App settings
+    connection: 'AzureWebJobsStorage',
     handler: async (queueItem, context) => {
         try {
             context.log('Queue trigger function processed work item', queueItem);
@@ -43,11 +44,12 @@ app.storageQueue('SharepointIndex', {
             const result = await processSharePointFile(context, fileUrl);
             context.log(result);
         } catch (error) {
-            context.log.error('Error processing queue item:', error.message);
+            context.log('Error message', errorObject);
             throw error; // Rethrow to trigger Azure Functions retry policy
         }
     }
 });
+
 
 app.http('SharepointIndex', {
     methods: ['GET', 'POST'],
@@ -105,10 +107,10 @@ app.http('SharepointIndex', {
 function logMessage(context, message, obj = null) {
     if (obj) {
         context.log(message, obj);
-        //appInsightsClient.trackTrace({ message: message, properties: obj });
+        appInsightsClient.trackTrace({ message: message, properties: obj });
     } else {
         context.log(message);
-        //appInsightsClient.trackTrace({ message: message });
+        appInsightsClient.trackTrace({ message: message });
     }
 }
 
@@ -207,7 +209,7 @@ async function getFileMetadata(context, graphClient, siteId, driveId, filePath) 
             error: error.message,
             fileUrl: fileUrl
         });
-        //appInsightsClient.trackException({ exception: error });
+        appInsightsClient.trackException({ exception: error });
         throw error;
     }
 }
@@ -377,7 +379,7 @@ async function processSharePointFile(context, fileUrl) {
             error: error.message,
             stack: error.stack
         });
-        //appInsightsClient.trackException({ exception: error });
+        appInsightsClient.trackException({ exception: error });
         throw error;
     }
 }
@@ -471,6 +473,7 @@ function extractTextFromSlide(slide) {
     return text.trim();
 }
 
+
 async function main() {
     try {
         const result = await processSharePointFile(null, process.env.DEFAULT_SHAREPOINT_FILE_PATH);
@@ -487,4 +490,4 @@ if (require.main === module) {
     main();
 }
 
-module.exports = { extractTextFromPowerPoint };
+module.exports = app;
