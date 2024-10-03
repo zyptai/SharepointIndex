@@ -1,0 +1,12 @@
+{
+    "bindings": [
+      {
+        "name": "queueItem",
+        "type": "queueTrigger",
+        "direction": "in",
+        "queueName": "file-processing-queue",  
+        "connection": "AzureWebJobsStorage"
+      }
+    ]
+  }
+  

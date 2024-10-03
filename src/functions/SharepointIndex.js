@@ -234,7 +234,7 @@ async function uploadToBlobStorage(context, fileContent, fileName, contentType) 
     logMessage(context, `File uploaded successfully to Blob Storage with content type: ${contentType}`);
 }
 
-function chunkContent(context, content, maxChunkSize = 8000) {
+function chunkContent(context, content, maxChunkSize = 2000) {
     const chunks = [];
     let currentChunk = "";
 
